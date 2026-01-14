@@ -1,0 +1,17 @@
+[package]
+name = "mouse-sensitivity"
+version = "0.1.0"
+edition = "2021"
+description = "A CLI utility to set mouse sensitivity on macOS using HID APIs"
+authors = ["Will Charczuk"]
+license = "MIT"
+
+[dependencies]
+clap = { version = "4.4", features = ["derive"] }
+core-foundation = "0.9"
+core-foundation-sys = "0.8"
+libc = "0.2"
+thiserror = "1.0"
+
+[build-dependencies]
+cc = "1.0"
