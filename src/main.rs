@@ -44,7 +44,7 @@ enum Commands {
         #[arg(long, group = "accel_toggle")]
         no_acceleration: bool,
 
-        /// Tracking speed (1.0-20.0, used with --acceleration)
+        /// Tracking speed (0.0-20.0, used with --acceleration)
         #[arg(short, long)]
         tracking_speed: Option<f64>,
 
@@ -110,6 +110,10 @@ fn list_devices(devices: &[PointerDevice]) {
 fn get_settings(devices: &[PointerDevice], device_index: Option<usize>) {
     let target_devices: Vec<(usize, &PointerDevice)> = match device_index {
         Some(idx) => {
+            if devices.is_empty() {
+                eprintln!("Error: No devices found");
+                std::process::exit(1);
+            }
             if idx >= devices.len() {
                 eprintln!("Error: Device index {} out of range (0-{})", idx, devices.len() - 1);
                 std::process::exit(1);
@@ -125,19 +129,16 @@ fn get_settings(devices: &[PointerDevice], device_index: Option<usize>) {
         let linear_on = device.get_linear_scaling() == Some(1);
 
         if linear_on {
-            // Linear mode: tracking speed controls pointer speed
+            // Linear mode: acceleration controls pointer speed (resolution is fixed)
             println!("    Mode: Linear (no acceleration)");
-            if let Some(tracking) = device.get_tracking_speed() {
-                // Convert tracking speed back to 0-1 scale for display
-                let speed = ((tracking - 0.2) / 2.8).clamp(0.0, 1.0);
+            if let Some(speed) = device.get_linear_speed() {
                 println!("    Speed: {:.2} (0.0-1.0 scale)", speed);
-                println!("    Raw tracking speed: {:.2}", tracking);
             }
         } else {
             // Normal mode: resolution controls base speed, acceleration adds curve
             println!("    Mode: Accelerated");
             if let Some(tracking) = device.get_tracking_speed() {
-                println!("    Tracking speed: {:.2} (1.0-20.0 scale)", tracking);
+                println!("    Tracking speed: {:.2} (0.0-20.0 scale)", tracking);
             }
             if let Some(resolution) = device.get_resolution() {
                 println!("    Resolution: {:.2}", resolution);
@@ -174,8 +175,8 @@ fn set_settings(
 
     // Validate ranges
     if let Some(ts) = tracking_speed {
-        if ts < 1.0 || ts > 20.0 {
-            eprintln!("Warning: Tracking speed {} out of range, will be clamped to 1.0-20.0", ts);
+        if ts < 0.0 || ts > 20.0 {
+            eprintln!("Warning: Tracking speed {} out of range, will be clamped to 0.0-20.0", ts);
         }
     }
 
@@ -192,8 +193,11 @@ fn set_settings(
             // Enable acceleration mode
             let _ = device.set_linear_scaling(false);
 
-            let ts = tracking_speed.unwrap_or(1.0);
-            match device.set_tracking_speed(ts) {
+            let ts = tracking_speed.unwrap_or_else(|| {
+                // Preserve current tracking speed if possible, else use reasonable default
+                device.get_tracking_speed().unwrap_or(2.0)
+            });
+            match device.set_acceleration_and_resolution(ts, None) {
                 Ok(()) => {
                     println!("[{}] {} - Acceleration enabled, tracking speed: {:.2}", i, device.name, ts);
                 }
@@ -203,12 +207,12 @@ fn set_settings(
             }
         } else {
             // Disable acceleration (linear mode)
+            let s = speed.unwrap_or(0.5);
             match device.set_linear_scaling(true) {
                 Ok(()) => {
-                    let s = speed.unwrap_or(0.5);
                     match device.set_speed(s) {
                         Ok(()) => {
-                            println!("[{}] {} - Acceleration disabled, speed: {:.2}", i, device.name, s);
+                            println!("[{}] {} - Acceleration disabled (linear mode), speed: {:.2}", i, device.name, s);
                         }
                         Err(e) => {
                             eprintln!("[{}] {} - Acceleration disabled, but failed to set speed: {}", i, device.name, e);
@@ -216,7 +220,7 @@ fn set_settings(
                     }
                 }
                 Err(e) => {
-                    eprintln!("[{}] {} - Error: {}", i, device.name, e);
+                    eprintln!("[{}] {} - Error setting linear mode: {}", i, device.name, e);
                 }
             }
         }
@@ -226,6 +230,10 @@ fn set_settings(
 fn get_target_devices(devices: &[PointerDevice], device_index: Option<usize>) -> Vec<(usize, &PointerDevice)> {
     match device_index {
         Some(idx) => {
+            if devices.is_empty() {
+                eprintln!("Error: No devices found");
+                std::process::exit(1);
+            }
             if idx >= devices.len() {
                 eprintln!("Error: Device index {} out of range (0-{})", idx, devices.len() - 1);
                 std::process::exit(1);

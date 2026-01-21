@@ -40,6 +40,7 @@ pub const K_IOHID_DEVICE_USAGE_KEY: &str = "DeviceUsage";
 pub const K_IOHID_PRODUCT_KEY: &str = "Product";
 pub const K_IOHID_VENDOR_ID_KEY: &str = "VendorID";
 pub const K_IOHID_PRODUCT_ID_KEY: &str = "ProductID";
+pub const K_IOHID_TRANSPORT_KEY: &str = "Transport";
 
 // FFI declarations for private IOKit HID APIs
 #[link(name = "IOKit", kind = "framework")]
@@ -138,7 +139,7 @@ impl PointerDevice {
     }
 
     /// Set the pointer resolution (IOFixed format)
-    /// Range: 10-1995 (clamped)
+    /// Range: 10-1995 (matching LinearMouse)
     pub fn set_resolution(&self, value: f64) -> Result<(), HidError> {
         let clamped = value.clamp(10.0, 1995.0);
         // Convert to IOFixed (16.16 fixed-point)
@@ -196,57 +197,6 @@ impl PointerDevice {
         }
     }
 
-    /// Get the current pointer acceleration
-    /// Range: 0-20, or -1 if disabled (pre-Sonoma)
-    pub fn get_acceleration(&self) -> Option<f64> {
-        // Check if linear scaling is enabled (Sonoma+), which means acceleration is disabled
-        if self.get_linear_scaling() == Some(1) {
-            return Some(-1.0);
-        }
-
-        let accel_key = self.get_acceleration_type_key();
-        let key = CFString::new(&accel_key);
-        unsafe {
-            let value = IOHIDServiceClientCopyProperty(self.service, key.as_concrete_TypeRef());
-            if !value.is_null() {
-                let cf_type: CFType = TCFType::wrap_under_create_rule(value);
-                if let Some(num) = cf_type.downcast::<CFNumber>() {
-                    let raw: i64 = num.to_i64()?;
-                    return Some(raw as f64 / 65536.0);
-                }
-            }
-        }
-        None
-    }
-
-    /// Set the pointer acceleration
-    /// Range: 0-20, or -1 to disable (pre-Sonoma)
-    pub fn set_acceleration(&self, value: f64) -> Result<(), HidError> {
-        let clamped = if value == -1.0 {
-            -1.0
-        } else {
-            value.clamp(0.0, 20.0)
-        };
-        let io_fixed = (clamped * 65536.0) as i64;
-
-        let accel_key = self.get_acceleration_type_key();
-        let key = CFString::new(&accel_key);
-        let cf_value = CFNumber::from(io_fixed);
-
-        unsafe {
-            let success = IOHIDServiceClientSetProperty(
-                self.service,
-                key.as_concrete_TypeRef(),
-                cf_value.as_CFTypeRef(),
-            );
-            if success {
-                Ok(())
-            } else {
-                Err(HidError::PropertySetFailed("acceleration".to_string()))
-            }
-        }
-    }
-
     /// Get linear scaling mode (macOS 14+ / Sonoma)
     /// 0 = acceleration enabled, 1 = acceleration disabled (linear)
     pub fn get_linear_scaling(&self) -> Option<i32> {
@@ -280,65 +230,43 @@ impl PointerDevice {
             if success {
                 Ok(())
             } else {
-                // This may fail on pre-Sonoma, which is expected
                 Err(HidError::PropertySetFailed(K_IOHID_USE_LINEAR_SCALING_KEY.to_string()))
             }
         }
     }
 
-    /// Convert user-facing speed (0.0-1.0) to HID resolution
-    /// Speed 0 = Resolution 1200 (slowest)
-    /// Speed 1 = Resolution 40 (fastest)
-    pub fn speed_to_resolution(speed: f64) -> f64 {
-        let clamped_speed = speed.clamp(0.0, 1.0);
-        // Linear interpolation in inverse space
-        // speed 0 -> 1/1200, speed 1 -> 1/40
-        let min_rate = 1.0 / 1200.0;
-        let max_rate = 1.0 / 40.0;
-        let rate = min_rate + clamped_speed * (max_rate - min_rate);
-        1.0 / rate
+    // Maximum tracking speed value in linear mode (maps to speed=1.0).
+    // LinearMouse exposes 0-20 directly; we map our 0-1 range to 0-MAX.
+    const LINEAR_MAX_TRACKING: f64 = 2.0;
+
+    /// Convert the current device state to user-facing speed (0.0-1.0) in linear mode.
+    /// Derived from tracking speed (acceleration value).
+    pub fn get_linear_speed(&self) -> Option<f64> {
+        let tracking = self.get_acceleration_raw()?;
+        Some((tracking / Self::LINEAR_MAX_TRACKING).clamp(0.0, 1.0))
     }
 
-    /// Convert HID resolution to user-facing speed (0.0-1.0)
-    pub fn resolution_to_speed(resolution: f64) -> f64 {
-        let min_rate = 1.0 / 1200.0;
-        let max_rate = 1.0 / 40.0;
-        let rate = 1.0 / resolution;
-        ((rate - min_rate) / (max_rate - min_rate)).clamp(0.0, 1.0)
-    }
-
-    /// Set speed using user-facing value (0.0-1.0)
-    /// In linear mode, sets tracking speed. In normal mode, sets resolution.
+    /// Set speed in linear (no-acceleration) mode using user-facing value (0.0-1.0).
+    /// Mirrors LinearMouse: only sets the acceleration type key (tracking speed).
+    /// Resolution is NOT modified in linear mode (matches LinearMouse behavior).
+    /// speed=0.0 → tracking=0.0 (no movement)
+    /// speed=0.05 → tracking=0.1 (very slow)
+    /// speed=0.5 → tracking=1.0 (moderate)
+    /// speed=1.0 → tracking=2.0 (fast)
     pub fn set_speed(&self, speed: f64) -> Result<(), HidError> {
-        let linear_on = self.get_linear_scaling() == Some(1);
-
-        if linear_on {
-            // In linear mode, speed is controlled by tracking speed (acceleration value)
-            // Map 0-1 to a usable tracking speed range
-            let tracking = Self::speed_to_tracking(speed);
-            self.set_tracking_speed(tracking)
-        } else {
-            // In normal mode, speed is controlled by resolution
-            let resolution = Self::speed_to_resolution(speed);
-            self.set_resolution(resolution)
-        }
-    }
-
-    /// Convert speed (0-1) to tracking speed for linear mode
-    fn speed_to_tracking(speed: f64) -> f64 {
-        // Map 0-1 to a usable range
-        // speed 0.0 -> tracking 0.2 (very slow)
-        // speed 0.5 -> tracking 1.0 (moderate)
-        // speed 1.0 -> tracking 3.0 (fast)
         let clamped = speed.clamp(0.0, 1.0);
-        0.2 + clamped * 2.8
+        let tracking = clamped * Self::LINEAR_MAX_TRACKING;
+        self.set_acceleration_raw(tracking)
     }
 
-    /// Set tracking speed for linear mode (0.0-20.0 range, matching LinearMouse)
-    /// This is the "Tracking speed" slider in LinearMouse when acceleration is disabled
-    pub fn set_tracking_speed(&self, value: f64) -> Result<(), HidError> {
-        let clamped = value.clamp(0.0, 20.0);
-        self.set_acceleration_raw(clamped)
+    /// Set acceleration value and resolution together for accelerated mode.
+    /// Resolution defaults to 400 (standard mouse DPI) if not specified.
+    pub fn set_acceleration_and_resolution(&self, acceleration: f64, resolution: Option<f64>) -> Result<(), HidError> {
+        let res = resolution.unwrap_or(400.0);
+        self.set_resolution(res)?;
+        self.set_acceleration_raw(acceleration.clamp(0.0, 20.0))?;
+        self.trigger_acceleration_refresh();
+        Ok(())
     }
 
     /// Get tracking speed (0.0-20.0 range) for linear mode
@@ -432,7 +360,27 @@ impl PointerDeviceManager {
         }
     }
 
-    /// Get all connected pointer devices (mice and trackpads)
+    /// Check if a device should be excluded (trackpads, keyboards, etc.)
+    fn is_excluded_device(service: IOHIDServiceClientRef, name: &str) -> bool {
+        let name_lower = name.to_lowercase();
+        // Exclude trackpads
+        if name_lower.contains("trackpad") {
+            return true;
+        }
+        // Exclude keyboards (e.g., "Apple Internal Keyboard / Trackpad" composite devices)
+        if name_lower.contains("keyboard") {
+            return true;
+        }
+        // Built-in trackpads use SPI transport; mice never do
+        if let Some(transport) = get_string_property(service, K_IOHID_TRANSPORT_KEY) {
+            if transport == "SPI" {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Get all connected pointer devices (mice only, excludes trackpads)
     pub fn get_devices(&self) -> Result<Vec<PointerDevice>, HidError> {
         unsafe {
             let services_ref = IOHIDEventSystemClientCopyServices(self.client);
@@ -455,6 +403,11 @@ impl PointerDeviceManager {
                 // Get device name
                 let name = get_string_property(service, K_IOHID_PRODUCT_KEY)
                     .unwrap_or_else(|| "Unknown Device".to_string());
+
+                // Skip non-mouse devices (trackpads, keyboards, etc.)
+                if Self::is_excluded_device(service, &name) {
+                    continue;
+                }
 
                 // Get vendor/product IDs
                 let vendor_id = get_int_property(service, K_IOHID_VENDOR_ID_KEY);
