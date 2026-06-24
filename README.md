@@ -1,131 +1,106 @@
 # mouse-sensitivity
 
-A command-line utility to set mouse sensitivity on macOS using HID APIs, similar to [LinearMouse](https://github.com/linearmouse/linearmouse).
+A command-line utility and background daemon for setting mouse sensitivity on macOS, using the same private IOKit HID APIs as [LinearMouse](https://github.com/linearmouse/linearmouse).
 
-## Features
+## Why a daemon?
 
-- **List connected mouse/pointer devices** with vendor and product IDs
-- **Disable/enable mouse acceleration** - uses linear scaling on macOS 14+
-- **Set pointer speed** (0.0-1.0 scale) when acceleration is disabled
-- **Set tracking speed** (1.0-20.0 scale) when acceleration is enabled
+Writing `HIDPointerResolution` from a one-shot process doesn't stick: the value reverts as soon as the `IOHIDEventSystemClient` that wrote it is released, and again whenever the device reconnects or WindowServer reasserts its own settings. LinearMouse solves this by keeping a client alive on a run loop and re-applying on device hotplug. This tool does the same — the `daemon` subcommand owns a long-lived client scheduled on a CFRunLoop, re-applies on `IOHIDEventSystemClientRegisterDeviceMatchingCallback`, and re-asserts every few seconds as a safety net.
 
-No sudo or special permissions required.
+The CLI talks to the daemon over a Unix domain socket; if the daemon isn't running, the CLI applies directly and warns that the change won't persist.
 
-## Installation
-
-### Build from source
+## Install
 
 ```bash
-# Clone the repository
-git clone <this-repo>
-cd mouse-sensitivity
-
-# Build release version
 cargo build --release
-
-# Binary is at ./target/release/mouse-sensitivity
+./target/release/mouse-sensitivity install   # writes a LaunchAgent and loads it
 ```
 
-### Install globally (optional)
-
-```bash
-sudo cp ./target/release/mouse-sensitivity /usr/local/bin/
-```
+`install` writes `~/Library/LaunchAgents/com.wcharczuk.mouse-sensitivity.plist` pointing at the current binary path and runs `launchctl load -w` so the daemon starts now and at every login. `uninstall` reverses it.
 
 ## Usage
 
 ```bash
-# List all connected mouse/pointer devices
+# Is the daemon up?
+mouse-sensitivity status
+
+# List connected mice
 mouse-sensitivity list
 
-# Get current settings for all devices
+# Show current settings (per device)
 mouse-sensitivity get
 
-# Get settings for a specific device (by index from list)
-mouse-sensitivity get -d 0
+# Disable the macOS acceleration curve and set tracking speed (0.0–20.0)
+# In linear mode, --acceleration IS the cursor speed.
+mouse-sensitivity set --disable-acceleration --acceleration 0.6875
 
-# Disable acceleration and set speed (0.0-1.0)
-mouse-sensitivity set --no-acceleration --speed 0.5
+# Re-enable the macOS curve; now --acceleration is curve steepness and
+# --speed (0.0–1.0, maps to HIDPointerResolution) is base sensitivity.
+mouse-sensitivity set --enable-acceleration --acceleration 0.875 --speed 0.36
 
-# Enable acceleration and set tracking speed (1.0-20.0)
-mouse-sensitivity set --acceleration --tracking-speed 2.0
+# Verify what the device actually reports (bypasses config)
+mouse-sensitivity get --live
 
-# Apply to a specific device only
-mouse-sensitivity set --no-acceleration --speed 0.5 -d 0
+# Target a single device
+mouse-sensitivity set -d 0 --disable-acceleration --speed 0.36
+
+# Stop the daemon (launchd will restart it if installed)
+mouse-sensitivity stop
 ```
 
-## How It Works
+`set` is incremental: any flag you omit keeps its previously-saved value for that device.
 
-This tool uses private IOKit HID APIs (`IOHIDServiceClient`) to interact with pointing devices at the driver level. It can:
+## Settings model (matches LinearMouse)
 
-1. **Modify acceleration**: Sets the `HIDMouseAcceleration` property. Setting to -1 disables acceleration on pre-Sonoma macOS.
+| Control | Range | HID property | Effect |
+|---|---|---|---|
+| `--disable-acceleration` / `--enable-acceleration` | bool | `HIDUseLinearScalingMouseAcceleration` | toggles the curve |
+| `--acceleration` | 0.0–40.0 | `HIDMouseAcceleration` (or the device's `HIDPointerAccelerationType`), IOFixed | **Linear mode: this is the cursor speed.** Accelerated mode: curve steepness. |
+| `--speed` | 0.0–1.0 | `HIDPointerResolution` = `1/(1/1200 + s·(1/40 − 1/1200))` | Base sensitivity. **No effect in linear mode** on macOS 14+. |
 
-2. **Linear scaling mode** (macOS 14+/Sonoma): Uses the `HIDUseLinearScalingMouseAcceleration` property for cleaner acceleration disabling.
+Properties are written in that order; the final acceleration write doubles as the refresh trigger that makes resolution take effect (the same hack LinearMouse uses).
 
-3. **Pointer resolution**: Modifies the `HIDPointerResolution` property in IOFixed format (16.16 fixed-point). This controls the effective sensitivity/speed.
+To replicate a LinearMouse config: its "Disable pointer acceleration" checkbox is `--disable-acceleration`, its "Tracking speed" slider is `--acceleration`, and its "Pointer speed" slider is `--speed`.
 
-## Limitations
+### Verifying
 
-- **Settings are not persistent**: Settings reset when the device is disconnected or the system restarts. Run the command again or add it to a login script.
+`get` shows what the daemon will enforce (from config). `get --live` reads the HID properties directly from the device — use that to confirm a change actually landed.
 
-- **Per-app settings**: Unlike LinearMouse, this tool doesn't support per-application sensitivity profiles.
+## Files
 
-## Making Settings Persistent
+- Socket: `~/Library/Application Support/mouse-sensitivity/daemon.sock`
+- Config: `~/Library/Application Support/mouse-sensitivity/config.json`
+- Log: `~/Library/Application Support/mouse-sensitivity/daemon.log` (when run via launchd)
+- LaunchAgent: `~/Library/LaunchAgents/com.wcharczuk.mouse-sensitivity.plist`
 
-Add to your shell profile (e.g., `~/.zshrc`) or create a login script:
+The config is JSON, keyed by `(vendor_id, product_id)`. You can edit it by hand and run `mouse-sensitivity set --reload` is not needed — the daemon picks up edits via the `set` command, or send `{"cmd":"reload"}` over the socket.
 
-```bash
-# Apply on login (disable acceleration with speed 0.5)
-mouse-sensitivity set --no-acceleration --speed 0.5
+## IPC protocol
+
+Newline-delimited JSON over the Unix socket. Requests:
+
+```json
+{"cmd":"ping"}
+{"cmd":"list"}
+{"cmd":"get","device":0}
+{"cmd":"set","device":0,"disable_acceleration":true,"acceleration":0.6875,"speed":0.36}
+{"cmd":"reload"}
+{"cmd":"shutdown"}
 ```
 
-Or create a LaunchAgent for automatic application at login.
+Responses are `{"status":"ok"}`, `{"status":"pong","version":"…"}`, `{"status":"devices","devices":[…]}`, or `{"status":"error","message":"…"}`.
 
 ## Comparison to LinearMouse
 
-| Feature | mouse-sensitivity | LinearMouse |
-|---------|------------------|-------------|
+| | mouse-sensitivity | LinearMouse |
+|---|---|---|
 | Disable acceleration | ✅ | ✅ |
-| Set acceleration level | ✅ | ✅ |
-| Set pointer speed | ✅ | ✅ |
+| Acceleration slider (0–20) | ✅ | ✅ |
+| Speed slider (0–1 → resolution) | ✅ | ✅ |
+| Persistent daemon | ✅ | ✅ |
+| Re-apply on hotplug | ✅ | ✅ |
 | Per-app profiles | ❌ | ✅ |
-| GUI | ❌ | ✅ |
-| Menu bar | ❌ | ✅ |
 | Scroll customization | ❌ | ✅ |
-| Login item | ❌ | ✅ |
-
-## Troubleshooting
-
-### Device not found
-
-Make sure your device is:
-1. Connected and powered on
-2. Recognized by the system (check System Information > USB/Bluetooth)
-3. A mouse or pointer device (keyboards with trackpoints may not appear)
-
-### Settings don't seem to apply
-
-Try running `get` to verify the settings were applied:
-```bash
-mouse-sensitivity get -d 0
-```
-
-If the device shows different values than expected, the device may be resetting its own properties.
-
-## Technical Details
-
-The tool uses these HID properties:
-
-| Property | Description | Range |
-|----------|-------------|-------|
-| `HIDPointerResolution` | Pointer speed in IOFixed format | 10-1995 |
-| `HIDMouseAcceleration` | Acceleration multiplier in IOFixed | 0-20, or -1 to disable |
-| `HIDUseLinearScalingMouseAcceleration` | Linear mode (Sonoma+) | 0 or 1 |
-
-IOFixed format uses 16.16 fixed-point representation (value × 65536).
-
-Speed is converted to resolution using: `resolution = 1 / (min_rate + speed * (max_rate - min_rate))`
-where min_rate = 1/1200 and max_rate = 1/40.
+| GUI / menu bar | ❌ | ✅ |
 
 ## License
 

@@ -7,8 +7,10 @@ use core_foundation::array::{CFArray, CFArrayRef};
 use core_foundation::base::{CFType, TCFType, kCFAllocatorDefault};
 use core_foundation::dictionary::CFDictionary;
 use core_foundation::number::CFNumber;
+use core_foundation::runloop::{CFRunLoop, CFRunLoopRef, kCFRunLoopDefaultMode};
 use core_foundation::string::{CFString, CFStringRef};
 use core_foundation_sys::array::CFArrayGetValueAtIndex;
+use std::ffi::c_void;
 use thiserror::Error;
 
 // Opaque types for HID service clients
@@ -68,7 +70,29 @@ extern "C" {
         key: CFStringRef,
         value: core_foundation_sys::base::CFTypeRef,
     ) -> bool;
+
+    fn IOHIDEventSystemClientScheduleWithRunLoop(
+        client: IOHIDEventSystemClientRef,
+        runloop: CFRunLoopRef,
+        mode: CFStringRef,
+    );
+
+    fn IOHIDEventSystemClientUnscheduleWithRunLoop(
+        client: IOHIDEventSystemClientRef,
+        runloop: CFRunLoopRef,
+        mode: CFStringRef,
+    );
+
+    fn IOHIDEventSystemClientRegisterDeviceMatchingCallback(
+        client: IOHIDEventSystemClientRef,
+        callback: IOHIDServiceClientCallback,
+        target: *mut c_void,
+        refcon: *mut c_void,
+    );
 }
+
+pub type IOHIDServiceClientCallback =
+    extern "C" fn(target: *mut c_void, refcon: *mut c_void, service: IOHIDServiceClientRef);
 
 #[derive(Error, Debug)]
 pub enum HidError {
@@ -235,49 +259,59 @@ impl PointerDevice {
         }
     }
 
-    // Maximum tracking speed value in linear mode (maps to speed=1.0).
-    // LinearMouse exposes 0-20 directly; we map our 0-1 range to 0-MAX.
-    const LINEAR_MAX_TRACKING: f64 = 2.0;
+    // LinearMouse maps its 0..1 "speed" slider to HIDPointerResolution via the
+    // reciprocal of a linearly-interpolated rate in [1/1200, 1/40], giving
+    // resolution=1200 at speed=0 and resolution=40 at speed=1.
+    const SPEED_RATE_MIN: f64 = 1.0 / 1200.0;
+    const SPEED_RATE_MAX: f64 = 1.0 / 40.0;
 
-    /// Convert the current device state to user-facing speed (0.0-1.0) in linear mode.
-    /// Derived from tracking speed (acceleration value).
-    pub fn get_linear_speed(&self) -> Option<f64> {
-        let tracking = self.get_acceleration_raw()?;
-        Some((tracking / Self::LINEAR_MAX_TRACKING).clamp(0.0, 1.0))
+    pub fn speed_to_resolution(speed: f64) -> f64 {
+        let s = speed.clamp(0.0, 1.0);
+        let rate = Self::SPEED_RATE_MIN + s * (Self::SPEED_RATE_MAX - Self::SPEED_RATE_MIN);
+        1.0 / rate
     }
 
-    /// Set speed in linear (no-acceleration) mode using user-facing value (0.0-1.0).
-    /// Mirrors LinearMouse: only sets the acceleration type key (tracking speed).
-    /// Resolution is NOT modified in linear mode (matches LinearMouse behavior).
-    /// speed=0.0 → tracking=0.0 (no movement)
-    /// speed=0.05 → tracking=0.1 (very slow)
-    /// speed=0.5 → tracking=1.0 (moderate)
-    /// speed=1.0 → tracking=2.0 (fast)
-    pub fn set_speed(&self, speed: f64) -> Result<(), HidError> {
-        let clamped = speed.clamp(0.0, 1.0);
-        let tracking = clamped * Self::LINEAR_MAX_TRACKING;
-        self.set_acceleration_raw(tracking)
+    pub fn resolution_to_speed(resolution: f64) -> f64 {
+        let rate = 1.0 / resolution.clamp(40.0, 1200.0);
+        ((rate - Self::SPEED_RATE_MIN) / (Self::SPEED_RATE_MAX - Self::SPEED_RATE_MIN)).clamp(0.0, 1.0)
     }
 
-    /// Set acceleration value and resolution together for accelerated mode.
-    /// Resolution defaults to 400 (standard mouse DPI) if not specified.
-    pub fn set_acceleration_and_resolution(&self, acceleration: f64, resolution: Option<f64>) -> Result<(), HidError> {
-        let res = resolution.unwrap_or(400.0);
-        self.set_resolution(res)?;
-        self.set_acceleration_raw(acceleration.clamp(0.0, 20.0))?;
-        self.trigger_acceleration_refresh();
-        Ok(())
+    /// Read the current speed (0..1) derived from HIDPointerResolution.
+    pub fn get_speed(&self) -> Option<f64> {
+        self.get_resolution().map(Self::resolution_to_speed)
     }
 
-    /// Get tracking speed (0.0-20.0 range) for linear mode
-    pub fn get_tracking_speed(&self) -> Option<f64> {
+    /// Read the current acceleration slider value (0..20).
+    pub fn get_acceleration(&self) -> Option<f64> {
         self.get_acceleration_raw()
+    }
+
+    /// Apply settings the way LinearMouse's `updatePointerSpeed` does.
+    ///
+    /// Linear mode (disable_acceleration = true): write linear-scaling=1 then
+    /// acceleration (which IS the cursor speed) and return; resolution is left
+    /// untouched.
+    ///
+    /// Accelerated mode: write linear-scaling=0, resolution from `speed`, then
+    /// acceleration (the final write also triggers resolution to take effect).
+    pub fn apply_settings(
+        &self,
+        disable_acceleration: bool,
+        acceleration: f64,
+        speed: f64,
+    ) -> Result<(), HidError> {
+        self.set_linear_scaling(disable_acceleration)?;
+        if disable_acceleration {
+            return self.set_acceleration_raw(acceleration.clamp(0.0, 40.0));
+        }
+        self.set_resolution(Self::speed_to_resolution(speed))?;
+        self.set_acceleration_raw(acceleration.clamp(0.0, 40.0))
     }
 
     /// Set acceleration without checking linear scaling state
     /// Used internally when we know we want to set the raw value
     fn set_acceleration_raw(&self, value: f64) -> Result<(), HidError> {
-        let clamped = value.clamp(0.0, 20.0);
+        let clamped = value.clamp(0.0, 40.0);
         let io_fixed = (clamped * 65536.0) as i64;
 
         let accel_key = self.get_acceleration_type_key();
@@ -319,6 +353,7 @@ impl PointerDevice {
 /// Manager for discovering and interacting with HID pointer devices
 pub struct PointerDeviceManager {
     client: IOHIDEventSystemClientRef,
+    scheduled: std::cell::Cell<bool>,
 }
 
 impl PointerDeviceManager {
@@ -356,7 +391,46 @@ impl PointerDeviceManager {
             let matching_array = CFArray::from_CFTypes(&[mouse_match, pointer_match]);
             IOHIDEventSystemClientSetMatchingMultiple(client, matching_array.as_concrete_TypeRef());
 
-            Ok(Self { client })
+            Ok(Self { client, scheduled: std::cell::Cell::new(false) })
+        }
+    }
+
+    /// Schedule the HID client on the current thread's run loop and register a
+    /// device-matching callback. The client must remain alive for the duration
+    /// of the run loop; dropping it will unschedule.
+    pub fn schedule_on_current_runloop(
+        &self,
+        callback: IOHIDServiceClientCallback,
+        context: *mut c_void,
+    ) {
+        unsafe {
+            let rl = CFRunLoop::get_current();
+            IOHIDEventSystemClientScheduleWithRunLoop(
+                self.client,
+                rl.as_concrete_TypeRef(),
+                kCFRunLoopDefaultMode,
+            );
+            IOHIDEventSystemClientRegisterDeviceMatchingCallback(
+                self.client,
+                callback,
+                context,
+                std::ptr::null_mut(),
+            );
+        }
+        self.scheduled.set(true);
+    }
+
+    fn unschedule_from_current_runloop(&self) {
+        if !self.scheduled.get() {
+            return;
+        }
+        unsafe {
+            let rl = CFRunLoop::get_current();
+            IOHIDEventSystemClientUnscheduleWithRunLoop(
+                self.client,
+                rl.as_concrete_TypeRef(),
+                kCFRunLoopDefaultMode,
+            );
         }
     }
 
@@ -398,7 +472,7 @@ impl PointerDeviceManager {
 
             let mut devices = Vec::new();
             for i in 0..count {
-                let service = CFArrayGetValueAtIndex(services.as_concrete_TypeRef(), i as isize) as IOHIDServiceClientRef;
+                let service = CFArrayGetValueAtIndex(services.as_concrete_TypeRef(), i) as IOHIDServiceClientRef;
 
                 // Get device name
                 let name = get_string_property(service, K_IOHID_PRODUCT_KEY)
@@ -455,11 +529,27 @@ fn get_int_property(service: IOHIDServiceClientRef, key: &str) -> Option<i64> {
 
 impl Drop for PointerDeviceManager {
     fn drop(&mut self) {
-        // The client is a Core Foundation object, release it
         if !self.client.is_null() {
+            self.unschedule_from_current_runloop();
             unsafe {
                 core_foundation_sys::base::CFRelease(self.client as *const _);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn speed_resolution_roundtrip() {
+        assert!((PointerDevice::speed_to_resolution(0.0) - 1200.0).abs() < 1e-6);
+        assert!((PointerDevice::speed_to_resolution(1.0) - 40.0).abs() < 1e-6);
+        for s in [0.0, 0.1, 0.36, 0.5, 0.9, 1.0] {
+            let r = PointerDevice::speed_to_resolution(s);
+            let s2 = PointerDevice::resolution_to_speed(r);
+            assert!((s - s2).abs() < 1e-6, "{s} -> {r} -> {s2}");
         }
     }
 }
