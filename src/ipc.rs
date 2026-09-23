@@ -15,8 +15,14 @@ pub enum Request {
     Set {
         device: Option<usize>,
         disable_acceleration: Option<bool>,
-        acceleration: Option<f64>,
+        /// LinearMouse's "Tracking speed"; see `config::DeviceSettings::tracking_speed`.
+        /// `acceleration` is accepted as an alias.
+        #[serde(alias = "acceleration")]
+        tracking_speed: Option<f64>,
         speed: Option<f64>,
+        /// Effective sensor DPI; see `config::DeviceSettings::dpi`.
+        #[serde(default)]
+        dpi: Option<f64>,
     },
     Reload,
     Shutdown,
@@ -29,8 +35,11 @@ pub struct DeviceInfo {
     pub vendor_id: Option<i64>,
     pub product_id: Option<i64>,
     pub disable_acceleration: bool,
-    pub acceleration: f64,
+    #[serde(alias = "acceleration")]
+    pub tracking_speed: f64,
     pub speed: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dpi: Option<f64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

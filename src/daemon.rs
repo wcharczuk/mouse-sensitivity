@@ -111,7 +111,7 @@ fn apply_config(manager: &PointerDeviceManager, cfg: &Config) {
     };
     for dev in &devices {
         if let Some(s) = cfg.settings_for(dev.vendor_id, dev.product_id) {
-            if let Err(e) = dev.apply_settings(s.disable_acceleration, s.acceleration, s.speed) {
+            if let Err(e) = dev.apply_settings(s.disable_acceleration, s.tracking_speed, s.speed) {
                 eprintln!("daemon: failed to apply settings to {}: {e}", dev.name);
             }
         }
@@ -176,8 +176,8 @@ fn handle_request(req: Request, shared: &Arc<Shared>) -> Response {
             shared.shutdown.store(true, Ordering::Release);
             Response::Ok
         }
-        Request::Set { device, disable_acceleration, acceleration, speed } => {
-            handle_set(shared, device, disable_acceleration, acceleration, speed)
+        Request::Set { device, disable_acceleration, tracking_speed, speed, dpi } => {
+            handle_set(shared, device, disable_acceleration, tracking_speed, speed, dpi)
         }
     }
 }
@@ -216,14 +216,15 @@ fn device_info(index: usize, dev: &PointerDevice, cfg: &Config) -> DeviceInfo {
         disable_acceleration: configured
             .map(|s| s.disable_acceleration)
             .unwrap_or_else(|| dev.get_linear_scaling() == Some(1)),
-        acceleration: configured
-            .map(|s| s.acceleration)
+        tracking_speed: configured
+            .map(|s| s.tracking_speed)
             .or_else(|| dev.get_acceleration())
             .unwrap_or(0.6875),
         speed: configured
             .map(|s| s.speed)
             .or_else(|| dev.get_speed())
             .unwrap_or(0.5),
+        dpi: configured.and_then(|s| s.dpi),
     }
 }
 
@@ -231,9 +232,19 @@ fn handle_set(
     shared: &Arc<Shared>,
     device: Option<usize>,
     disable_acceleration: Option<bool>,
-    acceleration: Option<f64>,
+    tracking_speed: Option<f64>,
     speed: Option<f64>,
+    dpi: Option<f64>,
 ) -> Response {
+    let dpi = match dpi {
+        Some(v) => match config::sanitize_dpi(v) {
+            Some(d) => Some(d),
+            None => {
+                return Response::Error { message: format!("invalid dpi {v}; must be a positive number") }
+            }
+        },
+        None => None,
+    };
     let manager = match PointerDeviceManager::new() {
         Ok(m) => m,
         Err(e) => return Response::Error { message: e.to_string() },
@@ -254,17 +265,26 @@ fn handle_set(
         None => devices.iter().collect(),
     };
     for dev in targets {
-        cfg.upsert(dev.vendor_id, dev.product_id, &dev.name, |s| {
-            if let Some(v) = disable_acceleration {
-                s.disable_acceleration = v;
-            }
-            if let Some(v) = acceleration {
-                s.acceleration = v.clamp(0.0, 40.0);
-            }
-            if let Some(v) = speed {
-                s.speed = v.clamp(0.0, 1.0);
-            }
-        });
+        cfg.upsert(
+            dev.vendor_id,
+            dev.product_id,
+            &dev.name,
+            || config::live_settings(dev),
+            |s| {
+                if let Some(v) = disable_acceleration {
+                    s.disable_acceleration = v;
+                }
+                if let Some(v) = tracking_speed {
+                    s.tracking_speed = v.clamp(0.0, 40.0);
+                }
+                if let Some(v) = speed {
+                    s.speed = v.clamp(0.0, 1.0);
+                }
+                if let Some(v) = dpi {
+                    s.dpi = Some(v);
+                }
+            },
+        );
     }
     if let Err(e) = config::save(&cfg) {
         return Response::Error { message: format!("failed to save config: {e}") };
